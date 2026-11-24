@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.5](https://github.com/jdx/pklr/compare/v6.0.4...v6.0.5) - 2026-11-24
+
+### Fixed
+
+- *(build)* build on 32-bit targets without 64-bit atomics (powerpc, mips) ([#486](https://github.com/jdx/pklr/pull/486))
+
+### Other
+
+- *(deps)* lock file maintenance ([#491](https://github.com/jdx/pklr/pull/491))
+- *(deps)* lock file maintenance ([#489](https://github.com/jdx/pklr/pull/489))
+
 ## [6.0.4](https://github.com/jdx/pklr/compare/v6.0.3...v6.0.4) - 2026-11-20
 
 ### Fixed
