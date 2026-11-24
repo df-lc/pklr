@@ -17,6 +17,13 @@ struct ModuleBase {
     super_name: Option<String>,
 }
 
+/// Whether `message` reports a body setting a property the class of the
+/// object it amends does not declare.
+fn is_undeclared_property_error(message: &str) -> bool {
+    (message.starts_with("Cannot find property `") && message.contains("` in object of type `"))
+        || message.starts_with("cannot add property '")
+}
+
 /// The members a module body evaluated.
 struct ModuleMembers<'b> {
     /// The classes, and type aliases to classes, the body declares.
@@ -815,6 +822,30 @@ impl Evaluator {
         // then classes (exported so they're accessible via dotted paths, e.g.
         // `import "helpers.pkl"` → `helpers.ClassName`), then properties. A
         // failed property that would be rendered fails the module.
+        // What each body-only property (`foo { ... }`) amends: the member as
+        // the base made it, for the properties of this body; what the base
+        // recorded, for the ones it inherits unchanged.
+        let parent_snapshot = self
+            .parent_module_key(module, path)
+            .and_then(|key| self.module_scopes.get(&key));
+        let inherited_overrides: Arc<HashSet<Name>> = parent_snapshot
+            .map(|snapshot| Arc::clone(&snapshot.assigned_overrides))
+            .unwrap_or_default();
+        let mut amend_bases: HashMap<Name, Option<Value>> = parent_snapshot
+            .map(|snapshot| (*snapshot.amend_bases).clone())
+            .unwrap_or_default();
+        for entry in body.iter() {
+            if let Entry::Property(prop) = entry
+                && !has_modifier(&prop.modifiers, Modifier::Local)
+            {
+                if prop.value.is_none() && prop.body.is_some() {
+                    amend_bases
+                        .insert(prop.name.clone(), base_obj.get(prop.name.as_ref()).cloned());
+                } else if prop.value.is_some() {
+                    amend_bases.remove(&prop.name);
+                }
+            }
+        }
         let mut out = base_obj;
         let mut poisoned_members = IndexMap::new();
         for entry in body.iter() {
@@ -1011,6 +1042,7 @@ impl Evaluator {
             &requested_eval_fields,
             &requested_output_fields,
             &synthesized_inherited_types,
+            &amend_bases,
         )?;
 
         if depth == 0 {
@@ -1081,6 +1113,7 @@ impl Evaluator {
                 self.plain_override_type_failures(
                     body,
                     &late_inherited_properties,
+                    &inherited_overrides,
                     &scope,
                     depth,
                     &mut inherited_type_failures,
@@ -1296,7 +1329,24 @@ impl Evaluator {
         {
             let locals = (!inherited).then_some(template_locals.as_ref()).flatten();
             let prop = match effective_late_properties.get(&prop.name) {
-                Some(base) => compose_amended_object(base, prop, locals),
+                Some(base) => {
+                    let composed = compose_amended_object(base, prop, locals);
+                    // An override without a type keeps the type its base
+                    // declared: a module amending this one is checked
+                    // against it too.
+                    match (&composed.type_ann, &base.type_ann) {
+                        (None, Some(ty))
+                            if !composed.is_method
+                                && !has_modifier(&base.modifiers, Modifier::Local) =>
+                        {
+                            Arc::new(Property {
+                                type_ann: Some(ty.clone()),
+                                ..(*composed).clone()
+                            })
+                        }
+                        _ => composed,
+                    }
+                }
                 None => match (&prop.value, locals) {
                     (Some(value), Some(_)) => Arc::new(Property {
                         value: Some(with_template_locals(locals, prop, value.clone())),
@@ -1325,6 +1375,28 @@ impl Evaluator {
             };
             effective_late_properties.insert(prop.name.clone(), prop);
         }
+        let mut assigned_overrides = (*inherited_overrides).clone();
+        for entry in module.body.iter() {
+            if let Entry::Property(prop) = entry
+                && !prop.is_method
+                && !has_modifier(&prop.modifiers, Modifier::Local)
+            {
+                if prop.type_ann.is_some() {
+                    assigned_overrides.remove(&prop.name);
+                } else if prop.value.is_some()
+                    && effective_late_properties
+                        .get(&prop.name)
+                        .is_some_and(|late: &Arc<Property>| late.type_ann.is_some())
+                {
+                    assigned_overrides.insert(prop.name.clone());
+                }
+            }
+        }
+        amend_bases.retain(|name, _| {
+            effective_late_properties
+                .get(name)
+                .is_some_and(|prop: &Arc<Property>| prop.value.is_none() && prop.body.is_some())
+        });
         let type_aliases = scope.flatten_type_aliases();
         let alias_definers = self.inherited_alias_definers(module, path, &type_aliases);
         let exported_types = self.exported_types(module, path);
@@ -1337,6 +1409,8 @@ impl Evaluator {
                 alias_definers,
                 exported_types,
                 module_identities: scope.flatten_module_identities(),
+                amend_bases: Arc::new(amend_bases),
+                assigned_overrides: Arc::new(assigned_overrides),
                 late_properties: effective_late_properties.into_values().collect(),
                 annotations: module_annotations.clone(),
             },
@@ -1462,6 +1536,7 @@ impl Evaluator {
         &mut self,
         body: &Body,
         inherited: &[Arc<Property>],
+        inherited_overrides: &HashSet<Name>,
         scope: &Scope,
         depth: usize,
         failures: &mut IndexMap<Name, String>,
@@ -1474,10 +1549,20 @@ impl Evaluator {
         {
             return;
         }
+        let declared_type = |name: &Name| {
+            inherited.iter().rev().find_map(|parent| {
+                (parent.name == *name && !has_modifier(&parent.modifiers, Modifier::Local))
+                    .then_some(parent.type_ann.as_ref())
+                    .flatten()
+            })
+        };
+        let mut checks: Vec<(&Name, &crate::parser::TypeExpr)> = Vec::new();
+        let mut overridden: HashSet<&Name> = HashSet::default();
         for entry in body.iter() {
             let Entry::Property(prop) = entry else {
                 continue;
             };
+            overridden.insert(&prop.name);
             if prop.type_ann.is_some()
                 || prop.is_method
                 || prop.value.is_none()
@@ -1486,22 +1571,56 @@ impl Evaluator {
             {
                 continue;
             }
-            let Some(ty) = inherited.iter().rev().find_map(|parent| {
-                (parent.name == prop.name && !has_modifier(&parent.modifiers, Modifier::Local))
-                    .then_some(parent.type_ann.as_ref())
-                    .flatten()
-            }) else {
-                continue;
-            };
-            if type_has_constraint(ty, scope) || !type_is_runtime_checkable(ty, scope) {
+            if let Some(ty) = declared_type(&prop.name) {
+                checks.push((&prop.name, ty));
+            }
+        }
+        // An inherited property this body leaves alone was evaluated again
+        // with this body's overrides in scope, and a constraint may read
+        // them: its value has to satisfy the constraint again. So has a
+        // value a module in between assigned under the type its base
+        // declared: its failure there does not travel with the property.
+        //
+        // A default nothing assigned is judged only in the module being
+        // rendered. A template may declare defaults that do not satisfy
+        // their constraints until a module amending it sets them (a pair
+        // of properties of which exactly one must be set), and Pkl reads
+        // them only when they are rendered.
+        let rendered_module = depth == 0;
+        for parent in inherited {
+            if !parent.is_method
+                && !has_modifier(&parent.modifiers, Modifier::Local)
+                && !overridden.contains(&parent.name)
+                && !failures.contains_key(&parent.name)
+                && let Some(ty) = &parent.type_ann
+                && (inherited_overrides.contains(&parent.name)
+                    || (rendered_module && type_has_constraint(ty, scope)))
+            {
+                checks.push((&parent.name, ty));
+            }
+        }
+        for (name, ty) in checks {
+            if !type_is_runtime_checkable(ty, scope) {
                 continue;
             }
-            let Some(value) = scope.get(&prop.name) else {
+            let Some(value) = scope.get(name) else {
                 continue;
             };
-            if matches!(self.eval_type_check(value, ty, scope, depth + 1), Ok(false)) {
-                let message = self.type_mismatch_message(ty, value, Some(&prop.name), scope);
-                failures.insert(prop.name.clone(), message);
+            match self.eval_type_check(value, ty, scope, depth + 1) {
+                Ok(false) => {
+                    let message = self.type_mismatch_message(ty, value, Some(name), scope);
+                    failures.insert(name.clone(), message);
+                }
+                // As for a synthesized inherited type: an explicit Pkl `throw`
+                // in a constraint is the member's failure; a constraint the
+                // evaluator cannot evaluate yet stays unchecked.
+                Err(Error::Eval(message))
+                    if type_constraint_has_explicit_throw(ty, scope)
+                        && !is_deferred_constraint_evaluator_error(&message) =>
+                {
+                    failures.insert(name.clone(), message);
+                }
+                _ => {}
             }
         }
     }
@@ -1638,7 +1757,28 @@ impl Evaluator {
         requested_eval_fields: &Option<HashSet<Name>>,
         requested_output_fields: &Option<HashSet<Name>>,
         synthesized_inherited_types: &HashSet<&str>,
+        amend_bases: &HashMap<Name, Option<Value>>,
     ) -> Result<IndexMap<Name, String>> {
+        // A body-only property is evaluated again over the member its body
+        // amends, not over the member the body already made: elements a
+        // nested body adds would be added once more.
+        let over_amend_base = |prop: &Property, scope: &Scope| -> Option<Scope> {
+            if prop.value.is_some()
+                || prop.body.is_none()
+                || has_modifier(&prop.modifiers, Modifier::Local)
+            {
+                return None;
+            }
+            let base = amend_bases.get(&prop.name)?;
+            let mut fresh = scope.clone();
+            match base {
+                Some(base) => fresh.set(&prop.name, base.clone()),
+                None => {
+                    Arc::make_mut(&mut fresh.vars).shift_remove(prop.name.as_ref());
+                }
+            }
+            Some(fresh)
+        };
         // A union property with no selected default fails only when read, so
         // it is handed back to poison the member rather than fail the module.
         let mut deferred = IndexMap::new();
@@ -1768,6 +1908,8 @@ impl Evaluator {
                         Arc::make_mut(&mut fresh.vars).shift_remove(prop.name.as_ref());
                         fresh_scope = Some(fresh);
                     }
+                } else {
+                    fresh_scope = over_amend_base(prop, scope);
                 }
                 match self.eval_property_with(
                     prop,
@@ -1838,8 +1980,13 @@ impl Evaluator {
                         }
                         _ => None,
                     });
+                let amend_scope = over_amend_base(prop, super_scope.as_ref().unwrap_or(scope));
+                let eval_scope = amend_scope
+                    .as_ref()
+                    .or(super_scope.as_ref())
+                    .unwrap_or(scope);
                 match self
-                    .eval_property_with(prop, super_scope.as_ref().unwrap_or(scope), depth, true)
+                    .eval_property_with(prop, eval_scope, depth, true)
                     .and_then(|value| {
                         if synthesized_inherited_types.contains(prop.name.as_ref())
                             && let (Some(value), Some(ty)) = (&value, &prop.type_ann)
@@ -1963,7 +2110,24 @@ impl Evaluator {
             for index in todo {
                 let entry = &body[index];
                 if let Some(name) = module_member_name(entry) {
-                    failed.remove(name);
+                    // A body that amends an inherited member is evaluated
+                    // again over that member, not over nothing, where the
+                    // body alone would wrongly succeed as a `Dynamic`: when
+                    // the member is an instance of a class, and when the body
+                    // failed for a property a class does not have.
+                    if let Some(message) = failed.remove(name)
+                        && let Entry::Property(prop) = entry
+                        && prop.value.is_none()
+                        && prop.body.is_some()
+                        && let Some(inherited) = base_obj.get(name)
+                        && (is_undeclared_property_error(&message)
+                            || matches!(inherited, Value::Object(_, Some(source))
+                                if source.kind == ObjectKind::Object
+                                    && source.type_name.is_some()
+                                    && source.type_identity.is_some()))
+                    {
+                        scope.set(name, inherited.clone());
+                    }
                     failed_indices.remove(&index);
                 }
                 match entry {

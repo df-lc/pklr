@@ -124,6 +124,7 @@ impl Evaluator {
                 depth,
             );
         }
+        self.check_declared_properties(base_map, base_source, overlay_entries)?;
         check_stale_class_read(base_map, base_source, overlay_entries, current_scope)?;
         if let Some(value) = self.try_eval_simple_class_amendment(
             base_map,

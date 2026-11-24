@@ -1224,6 +1224,19 @@ impl Evaluator {
                             }
                             let mut result =
                                 if let Some(default_entries) = explicit_default_entries.as_ref() {
+                                    // The template already holds what the
+                                    // `default` body made, so that body is
+                                    // judged against the value type itself.
+                                    if !is_typed_new
+                                        && let Some((_, Value::Object(type_map, Some(type_src)))) =
+                                            type_default
+                                    {
+                                        self.check_declared_properties(
+                                            type_map,
+                                            type_src,
+                                            default_entries,
+                                        )?;
+                                    }
                                     let mut overlay_entries = default_entries.to_vec();
                                     overlay_entries.extend(body.iter().cloned());
                                     self.eval_amended_object(

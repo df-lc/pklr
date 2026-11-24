@@ -76,6 +76,10 @@ name = "nesting"
 required-features = ["native-io"]
 
 [[test]]
+name = "amended_checks"
+required-features = ["native-io"]
+
+[[test]]
 name = "allowed_modules"
 required-features = ["native-io"]
 

@@ -612,11 +612,11 @@ amended = (steps) { ["o"] = other }
 fn typed_mapping_entry_still_merges_template_into_untyped_values() {
     let json = eval(
         r#"
-class Step { name: String = "x" }
+class Step { name: String = "x"; note: String = "n" }
 steps: Mapping<String, Step> = new Mapping<String, Step> {}
 amended = (steps) {
     ["dynamic"] = new Dynamic { extra = 1 }
-    ["anonymous"] = new { extra = 2 }
+    ["anonymous"] = new { note = "m" }
 }
 "#,
     );
@@ -624,7 +624,23 @@ amended = (steps) {
     assert_eq!(json["amended"]["dynamic"], serde_json::json!({"extra": 1}));
     assert_eq!(
         json["amended"]["anonymous"],
-        serde_json::json!({"extra": 2, "name": "x"})
+        serde_json::json!({"name": "x", "note": "m"})
+    );
+
+    // This follows `pkl` (0.32.2): an untyped `new` is an instance of the
+    // value type, so it takes only the properties `Step` declares.
+    let error = eval_fails(
+        r#"
+class Step { name: String = "x" }
+steps: Mapping<String, Step> = new Mapping<String, Step> {}
+amended = (steps) {
+    ["anonymous"] = new { extra = 2 }
+}
+"#,
+    );
+    assert!(
+        error.contains("Cannot find property `extra` in object of type `test#Step`."),
+        "{error}"
     );
 }
 

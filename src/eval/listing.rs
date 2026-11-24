@@ -998,6 +998,79 @@ pub(super) fn check_no_elements(source: &ObjectSource, entries: &[Entry]) -> Res
     }
 }
 
+impl Evaluator {
+    /// Reject a property the body of an instance of a class sets that the
+    /// class does not declare. As where `new C { ... }` is checked, an `open`
+    /// class is left alone. Only a direct, non-local property of the body is
+    /// judged; what a generator produces is not.
+    pub(super) fn check_declared_properties(
+        &mut self,
+        base_map: &ObjectMap,
+        source: &ObjectSource,
+        entries: &[Entry],
+    ) -> Result<()> {
+        // Only a class with a definition site is judged: its declarations are
+        // the entries of its source. A class extending `module` inherits
+        // declarations its source may not carry yet.
+        let (Some(type_name), Some(identity)) = (&source.type_name, &source.type_identity) else {
+            return Ok(());
+        };
+        if !matches!(source.kind, ObjectKind::Object | ObjectKind::Class)
+            || identity.starts_with("pkl:")
+            || source.is_module
+            || source.is_parsed_json
+            || source.parent_type_names.iter().any(|n| n == "module")
+        {
+            return Ok(());
+        }
+        let undeclared = |name: &str| {
+            !(base_map.contains_key(name)
+                || source
+                    .evaluated_properties
+                    .iter()
+                    .any(|known| &**known == name)
+                || source.body_members.contains(name)
+                || source
+                    .entries
+                    .iter()
+                    .any(|entry| matches!(entry, Entry::Property(prop) if &*prop.name == name)))
+        };
+        let Some(name) = entries.iter().find_map(|entry| match entry {
+            Entry::Property(prop)
+                if !prop.is_method
+                    && !has_modifier(&prop.modifiers, Modifier::Local)
+                    && undeclared(&prop.name) =>
+            {
+                Some(&prop.name)
+            }
+            _ => None,
+        }) else {
+            return Ok(());
+        };
+        // An instance does not reliably record whether its class is `open`
+        // (a rebuilt source says it is), so the class itself is asked: the
+        // instance's prototype, or the class its defining module binds.
+        let simple = type_name.rsplit('.').next().unwrap_or(type_name);
+        let class_is_open = match (&source.kind, &source.prototype) {
+            (ObjectKind::Class, _) => source.is_open,
+            (_, Some(Value::Object(_, Some(class)))) if class.kind == ObjectKind::Class => {
+                class.is_open
+            }
+            _ => match self.defined_class(identity, simple) {
+                Some(Value::Object(_, Some(class))) => class.is_open,
+                _ => source.is_open,
+            },
+        };
+        if class_is_open {
+            return Ok(());
+        }
+        Err(Error::Eval(format!(
+            "Cannot find property `{name}` in object of type `{}`.",
+            qualified_class_name(Some(identity), type_name)
+        )))
+    }
+}
+
 /// Whether `ty` cannot declare a listing, judged without resolving aliases or
 /// module scopes: a non-`Listing` generic, a primitive, or a name that
 /// `is_class` says is a class. Lets hot paths skip building a type scope.

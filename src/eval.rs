@@ -308,6 +308,15 @@ struct ModuleScopeSnapshot {
     /// The classes and type aliases an importer can name as `m.Name`.
     exported_types: HashSet<Arc<str>>,
     late_properties: Vec<Arc<Property>>,
+    /// For each late property that is only a body (`foo { ... }`), the value
+    /// the body amends: the member as the module's base made it (`None` when
+    /// the base made none). Evaluating the body again amends this value, not
+    /// the member the body already made.
+    amend_bases: Arc<HashMap<Name, Option<Value>>>,
+    /// The late properties whose value an amending or extending module
+    /// assigned without a type of its own, under the type a base declared.
+    /// A module further down checks the value against that type again.
+    assigned_overrides: Arc<HashSet<Name>>,
     /// The property annotations the module declares or inherits.
     annotations: Option<Arc<crate::value::ModuleAnnotations>>,
 }
